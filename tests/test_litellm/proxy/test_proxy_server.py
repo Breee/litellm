@@ -9179,9 +9179,114 @@ class TestLazyFeaturesNotImportedAtStartup:
             f"should be loaded via LazyFeatureMiddleware: {leaks}"
         )
 
+    def test_llm_passthrough_routes_only_registered_through_lazy_loading(self):
+        """Provider passthrough catch-alls (/bedrock/{endpoint:path}, ...) must not
+        sit in the boot route table: the only way they get onto ``app`` is the
+        lazy loader, so their count equals what the loader registered (or zero)."""
+        module_path = "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints"
+
+        present = [
+            r for r in app.router.routes if getattr(getattr(r, "endpoint", None), "__module__", None) == module_path
+        ]
+        lazy_routes = getattr(app.state, "lazy_routes", {})
+
+        assert len(present) == len(lazy_routes.get(module_path, ()))
+
 
 class TestLazyFeatureMiddleware:
     """Behavior of the middleware itself, exercised in isolation."""
+
+    @pytest.mark.asyncio
+    async def test_llm_passthrough_loads_on_first_provider_request(self):
+        """A request to any provider passthrough prefix must register both routers
+        of llm_passthrough_endpoints, and every route they carry must be reachable
+        through the feature's prefixes (otherwise it 404s until something else
+        happens to load the module)."""
+        from fastapi import FastAPI
+        from fastapi.routing import APIRoute
+
+        from litellm.proxy._lazy_features import LAZY_FEATURES, LazyFeatureMiddleware
+
+        feat = next(f for f in LAZY_FEATURES if f.name == "llm_passthrough")
+
+        async def downstream(scope, receive, send):
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b""})
+
+        target_app = FastAPI()
+        mw = LazyFeatureMiddleware(downstream, fastapi_app=target_app, features=(feat,))
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(message):
+            pass
+
+        assert all("{endpoint:path}" not in r.path for r in target_app.router.routes)
+
+        await mw({"type": "http", "path": "/mistral/v1/models", "method": "GET", "headers": []}, receive, send)
+
+        paths = [r.path for r in target_app.state.lazy_routes[feat.module_path]]
+        http_paths = {r.path for r in target_app.state.lazy_routes[feat.module_path] if isinstance(r, APIRoute)}
+        assert {
+            "/mistral/{endpoint:path}",
+            "/openai/{endpoint:path}",
+            "/openai_passthrough/{endpoint:path}",
+        } <= http_paths
+        assert set(paths) <= {r.path for r in target_app.router.routes}
+        unreachable = [p for p in paths if not feat.matches(p.replace("{endpoint:path}", "x"))]
+        assert unreachable == [], f"routes the middleware would never load: {unreachable}"
+
+    @pytest.mark.asyncio
+    async def test_lazy_routes_land_in_registry_order_not_first_hit_order(self):
+        """Two lazy features with overlapping paths must resolve the same way no
+        matter which one a deployment hits first, so lazily registered routes are
+        kept in registry order behind the eager routes."""
+        from fastapi import APIRouter, FastAPI
+
+        from litellm.proxy._lazy_features import LazyFeature, LazyFeatureMiddleware
+
+        def make_register(path):
+            def register(app, module):
+                router = APIRouter()
+                router.add_api_route(path, lambda: None, methods=["POST"])
+                app.include_router(router)
+
+            return register
+
+        catch_all = LazyFeature(
+            name="catch_all",
+            module_path="json",
+            path_prefixes=("/openai/",),
+            register_fn=make_register("/openai/{endpoint:path}"),
+        )
+        specific = LazyFeature(
+            name="specific",
+            module_path="base64",
+            path_prefixes=("/openai/v1/realtime", "/v1/realtime"),
+            register_fn=make_register("/openai/v1/realtime/calls"),
+        )
+
+        async def downstream(scope, receive, send):
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b""})
+
+        target_app = FastAPI()
+        target_app.add_api_route("/eager", lambda: None)
+        mw = LazyFeatureMiddleware(downstream, fastapi_app=target_app, features=(catch_all, specific))
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(message):
+            pass
+
+        await mw({"type": "http", "path": "/v1/realtime/calls", "method": "POST", "headers": []}, receive, send)
+        assert [r.path for r in target_app.router.routes][-1] == "/openai/v1/realtime/calls"
+        await mw({"type": "http", "path": "/openai/v1/models", "method": "GET", "headers": []}, receive, send)
+
+        paths = [r.path for r in target_app.router.routes]
+        assert paths.index("/eager") < paths.index("/openai/{endpoint:path}") < paths.index("/openai/v1/realtime/calls")
 
     @pytest.mark.asyncio
     async def test_first_request_triggers_load_subsequent_does_not(self):

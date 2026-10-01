@@ -140,7 +140,7 @@ func handleMCPAPIResponse(resp *http.Response, result interface{}, client *Clien
 		return fmt.Errorf("failed to read response body: %v", err)
 	}
 
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		var errResp ErrorResponse
 		if err := json.Unmarshal(bodyBytes, &errResp); err == nil {
 			if isMCPServerNotFoundError(errResp) {
